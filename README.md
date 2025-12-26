@@ -1,11 +1,11 @@
-# chroma-net
+# orion-net
 
 Run the room server (development):
 
 ```powershell
 set HUB_URL=ws://localhost:8080
 set MY_ROOM_NAME="My Room"
-python chroma_net.py
+python orion-net.py
 ```
 
 Environment variables:
