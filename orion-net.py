@@ -22,6 +22,8 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 import base64
+import random
+import string
 
 # Custom Logging
 class ColoredFormatter(logging.Formatter):
@@ -169,6 +171,14 @@ async def handle_chat_client(websocket):
         encrypted_join = cipher_suite.encrypt(join_msg.encode())
         await broadcast(json.dumps({"type": "chat", "ciphertext": base64.b64encode(encrypted_join).decode()}))
         
+        # Update Hub with new count
+        # We need a reference to the hub websocket, but it's in a different task.
+        # For now, we rely on the periodic re-registration or we can add a global hub_ws variable.
+        # A simpler way for this MVP is to just let the hub know via a new connection or shared state.
+        # But since register_with_hub is a loop, we can't easily access it.
+        # Let's just log it for now. The hub will get the count on next re-connect/update if we implement that.
+        # Actually, let's implement a simple status update mechanism if we can.
+        
         # Send help message (Encrypted)
         help_msg = "Commands: /help, /who, /time, /uptime, /motd"
         enc_help = cipher_suite.encrypt(help_msg.encode())
@@ -280,40 +290,71 @@ async def register_with_hub():
                     my_address = RENDER_EXTERNAL_URL.replace("https://", "wss://").replace("http://", "ws://")
                 else:
                     my_address = f"ws://localhost:{PORT}"
-                reg = {"type": "register", "name": MY_ROOM_NAME, "address": my_address}
+                
+                # Initial Registration
+                reg = {
+                    "type": "register", 
+                    "name": MY_ROOM_NAME, 
+                    "address": my_address,
+                    "online": len(connected_clients)
+                }
                 await ws.send(json.dumps(reg))
-                async for raw in ws:
-                    try:
-                        data = json.loads(raw)
-                    except Exception:
-                        continue
-                    if data.get("type") == "challenge":
-                        challenge = data.get("challenge_string")
-                        difficulty = int(data.get("difficulty", 4))
-                        logging.info("Solving PoW challenge...")
-                        nonce = solve_challenge(challenge, difficulty)
-                        await ws.send(json.dumps({"type": "response", "challenge_string": challenge, "nonce": nonce}))
-                    elif data.get("type") == "success":
-                        logging.info("Registered with hub successfully")
-                        global MAINTENANCE_MODE
-                        MAINTENANCE_MODE = data.get("maintenance", False)
-                        if MAINTENANCE_MODE:
-                            logging.warning("Hub is in Maintenance Mode")
-                        # keep connection alive and listen for broadcasts
-                        continue
-                    elif data.get("type") == "maintenance_update":
-                        MAINTENANCE_MODE = data.get("enabled", False)
-                        status = "ON" if MAINTENANCE_MODE else "OFF"
-                        logging.warning(f"Maintenance Mode set to {status}")
-                        if MAINTENANCE_MODE:
-                            await broadcast("[System] ⚠️ Server is entering Maintenance Mode. New connections disabled.")
-                        else:
-                            await broadcast("[System] ✅ Maintenance Mode disabled.")
-                    elif data.get("type") == "broadcast":
-                        msg = data.get("message")
-                        if msg:
-                            logging.info(f"Received system broadcast: {msg}")
-                            await broadcast(f"[System] {msg}")
+
+                # Background task to send updates
+                async def send_updates():
+                    last_count = len(connected_clients)
+                    while True:
+                        await asyncio.sleep(5)
+                        current_count = len(connected_clients)
+                        if current_count != last_count:
+                            try:
+                                await ws.send(json.dumps({
+                                    "type": "status_update",
+                                    "online": current_count
+                                }))
+                                last_count = current_count
+                            except Exception:
+                                break
+
+                update_task = asyncio.create_task(send_updates())
+
+                try:
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        if data.get("type") == "challenge":
+                            challenge = data.get("challenge_string")
+                            difficulty = int(data.get("difficulty", 4))
+                            logging.info("Solving PoW challenge...")
+                            nonce = solve_challenge(challenge, difficulty)
+                            await ws.send(json.dumps({"type": "response", "challenge_string": challenge, "nonce": nonce}))
+                        elif data.get("type") == "success":
+                            room_id = data.get("id", "unknown")
+                            logging.info(f"Registered with hub successfully. Assigned Room ID: {room_id}")
+                            print(f"\033[38;5;51m   Room ID: {room_id}\033[0m")
+                            
+                            global MAINTENANCE_MODE
+                            MAINTENANCE_MODE = data.get("maintenance", False)
+                            if MAINTENANCE_MODE:
+                                logging.warning("Hub is in Maintenance Mode")
+                        elif data.get("type") == "maintenance_update":
+                            MAINTENANCE_MODE = data.get("enabled", False)
+                            status = "ON" if MAINTENANCE_MODE else "OFF"
+                            logging.warning(f"Maintenance Mode set to {status}")
+                            if MAINTENANCE_MODE:
+                                await broadcast("[System] ⚠️ Server is entering Maintenance Mode. New connections disabled.")
+                            else:
+                                await broadcast("[System] ✅ Maintenance Mode disabled.")
+                        elif data.get("type") == "broadcast":
+                            msg = data.get("message")
+                            if msg:
+                                logging.info(f"Received system broadcast: {msg}")
+                                await broadcast(f"[System] {msg}")
+                finally:
+                    update_task.cancel()
+
         except Exception as e:
             logging.warning(f"Hub registration failed: {e}")
             await asyncio.sleep(10)
@@ -321,7 +362,7 @@ async def register_with_hub():
 
 async def main():
     print(get_colored_banner())
-    print(f"\033[38;5;39m   :: ORION NET ::   \033[0m v1.0.0\n")
+    print(f"\033[38;5;39m   :: ORION NET ::   \033[0m v1.0.0")
     
     # start chat server and hub registration concurrently
     chat_server = serve(handle_chat_client, "0.0.0.0", PORT)
