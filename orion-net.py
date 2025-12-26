@@ -18,6 +18,10 @@ import logging
 import hashlib
 import time
 from websockets import serve, connect
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+import base64
 
 # Custom Logging
 class ColoredFormatter(logging.Formatter):
@@ -91,6 +95,10 @@ MAINTENANCE_MODE = False
 connected_clients = set()
 client_names = {}
 
+# Encryption Setup
+SESSION_KEY = Fernet.generate_key()
+cipher_suite = Fernet(SESSION_KEY)
+logging.info(f"Generated Session Key: {SESSION_KEY.decode()[:10]}...")
 
 async def broadcast(message):
     if not connected_clients:
@@ -109,70 +117,126 @@ async def broadcast(message):
 
 async def handle_chat_client(websocket):
     if MAINTENANCE_MODE:
-        await websocket.send("⚠️ Maintenance Mode is ON. Please try again later.")
+        await websocket.send(json.dumps({"type": "error", "message": "⚠️ Maintenance Mode is ON. Please try again later."}))
         await websocket.close()
         return
 
     client_ip = websocket.remote_address[0] if websocket.remote_address else "unknown"
     logging.info(f"New client connected from {client_ip}")
     connected_clients.add(websocket)
+    
     try:
-        await websocket.send("Welcome! Please enter your name:")
-        name = await websocket.recv()
+        # 1. Handshake: Receive Public Key
+        raw_handshake = await websocket.recv()
+        handshake_data = json.loads(raw_handshake)
+        
+        if handshake_data.get("type") != "handshake":
+            await websocket.close()
+            return
+            
+        pem_key = handshake_data.get("pubkey").encode()
+        public_key = serialization.load_pem_public_key(pem_key)
+        
+        # 2. Encrypt Session Key with Client's Public Key
+        encrypted_session_key = public_key.encrypt(
+            SESSION_KEY,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        
+        # 3. Send Encrypted Session Key
+        await websocket.send(json.dumps({
+            "type": "session_key",
+            "key": base64.b64encode(encrypted_session_key).decode()
+        }))
+        
+        logging.info(f"Secure session established with {client_ip}")
+
+        # 4. Wait for Name (Encrypted)
+        encrypted_name_packet = await websocket.recv()
+        name_data = json.loads(encrypted_name_packet)
+        encrypted_name = base64.b64decode(name_data["ciphertext"])
+        name = cipher_suite.decrypt(encrypted_name).decode()
+        
         client_names[websocket] = name
         logging.info(f"Client '{name}' joined the room (total: {len(connected_clients)})")
-        await broadcast(f"--- {name} has joined the room ---")
         
-        # Send help message
-        await websocket.send("Commands: /help, /who, /time, /uptime, /motd")
+        # Broadcast Join (Encrypted)
+        join_msg = f"--- {name} has joined the room ---"
+        encrypted_join = cipher_suite.encrypt(join_msg.encode())
+        await broadcast(json.dumps({"type": "chat", "ciphertext": base64.b64encode(encrypted_join).decode()}))
         
-        async for message in websocket:
-            sender = client_names.get(websocket, "anonymous")
-            
-            # Handle commands
-            if message.startswith('/'):
-                cmd = message.lower().strip()
-                
-                if cmd == '/help':
-                    help_text = "Available commands:\n/help - Show this help\n/who - List users\n/time - Current time\n/uptime - Room uptime\n/motd - Message of the day\n/nick <name> - Change nickname"
-                    await websocket.send(help_text)
+        # Send help message (Encrypted)
+        help_msg = "Commands: /help, /who, /time, /uptime, /motd"
+        enc_help = cipher_suite.encrypt(help_msg.encode())
+        await websocket.send(json.dumps({"type": "chat", "ciphertext": base64.b64encode(enc_help).decode()}))
+        
+        async for raw_message in websocket:
+            try:
+                data = json.loads(raw_message)
+                if data.get("type") == "chat":
+                    ciphertext = base64.b64decode(data["ciphertext"])
+                    message = cipher_suite.decrypt(ciphertext).decode()
+                    sender = client_names.get(websocket, "anonymous")
                     
-                elif cmd == '/who':
-                    users = [client_names.get(ws, 'anonymous') for ws in connected_clients]
-                    await websocket.send(f"Users in room ({len(users)}): {', '.join(users)}")
-                    
-                elif cmd == '/time':
-                    import datetime
-                    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    await websocket.send(f"Current time: {now}")
-                    
-                elif cmd == '/uptime':
-                    import time
-                    uptime = time.time() - start_time
-                    hours, remainder = divmod(int(uptime), 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    await websocket.send(f"Room uptime: {hours}h {minutes}m {seconds}s")
-                    
-                elif cmd == '/motd':
-                    motd = os.environ.get('ROOM_MOTD', 'Welcome to this Orion-Net room!')
-                    await websocket.send(f"MOTD: {motd}")
-                    
-                elif cmd.startswith('/nick '):
-                    new_name = cmd[6:].strip()
-                    if new_name and len(new_name) <= 20:
-                        old_name = client_names[websocket]
-                        client_names[websocket] = new_name
-                        await broadcast(f"--- {old_name} changed name to {new_name} ---")
-                        logging.info(f"Client '{old_name}' changed name to '{new_name}'")
-                    else:
-                        await websocket.send("Invalid nickname (max 20 characters)")
+                    # Handle commands
+                    if message.startswith('/'):
+                        cmd = message.lower().strip()
+                        response = ""
                         
-                else:
-                    await websocket.send(f"Unknown command: {cmd}. Type /help for available commands.")
-            else:
-                # Regular chat message
-                logging.info(f"[{sender}]: {message}")
-                await broadcast(f"[{sender}] {message}")
+                        if cmd == '/help':
+                            response = "Available commands:\n/help - Show this help\n/who - List users\n/time - Current time\n/uptime - Room uptime\n/motd - Message of the day\n/nick <name> - Change nickname"
+                            
+                        elif cmd == '/who':
+                            users = [client_names.get(ws, 'anonymous') for ws in connected_clients]
+                            response = f"Users in room ({len(users)}): {', '.join(users)}"
+                            
+                        elif cmd == '/time':
+                            import datetime
+                            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            response = f"Current time: {now}"
+                            
+                        elif cmd == '/uptime':
+                            import time
+                            uptime = time.time() - start_time
+                            hours, remainder = divmod(int(uptime), 3600)
+                            minutes, seconds = divmod(remainder, 60)
+                            response = f"Room uptime: {hours}h {minutes}m {seconds}s"
+                            
+                        elif cmd == '/motd':
+                            motd = os.environ.get('ROOM_MOTD', 'Welcome to this Orion-Net room!')
+                            response = f"MOTD: {motd}"
+                            
+                        elif cmd.startswith('/nick '):
+                            new_name = cmd[6:].strip()
+                            if new_name and len(new_name) <= 20:
+                                old_name = client_names[websocket]
+                                client_names[websocket] = new_name
+                                
+                                change_msg = f"--- {old_name} changed name to {new_name} ---"
+                                enc_change = cipher_suite.encrypt(change_msg.encode())
+                                await broadcast(json.dumps({"type": "chat", "ciphertext": base64.b64encode(enc_change).decode()}))
+                                logging.info(f"Client '{old_name}' changed name to '{new_name}'")
+                            else:
+                                response = "Invalid nickname (max 20 characters)"
+                        else:
+                            response = f"Unknown command: {cmd}. Type /help for available commands."
+                            
+                        if response:
+                            enc_resp = cipher_suite.encrypt(response.encode())
+                            await websocket.send(json.dumps({"type": "chat", "ciphertext": base64.b64encode(enc_resp).decode()}))
+                            
+                    else:
+                        # Regular chat message
+                        logging.info(f"[{sender}]: (Encrypted Message)")
+                        full_msg = f"[{sender}] {message}"
+                        enc_full = cipher_suite.encrypt(full_msg.encode())
+                        await broadcast(json.dumps({"type": "chat", "ciphertext": base64.b64encode(enc_full).decode()}))
+            except Exception as e:
+                logging.error(f"Decryption error: {e}")
                 
     except Exception as e:
         logging.warning(f"Client connection error: {e}")
@@ -180,7 +244,10 @@ async def handle_chat_client(websocket):
         connected_clients.discard(websocket)
         name = client_names.pop(websocket, "anonymous")
         logging.info(f"Client '{name}' left the room (remaining: {len(connected_clients)})")
-        await broadcast(f"--- {name} has left the room ---")
+        
+        leave_msg = f"--- {name} has left the room ---"
+        enc_leave = cipher_suite.encrypt(leave_msg.encode())
+        await broadcast(json.dumps({"type": "chat", "ciphertext": base64.b64encode(enc_leave).decode()}))
 
 
 def solve_challenge(challenge_string, difficulty):
